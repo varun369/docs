@@ -1,0 +1,587 @@
+---
+title: Sandboxes
+sidebarTitle: Sandboxes
+description: Execute code in isolated environments with sandbox backends
+---
+
+import SandboxBasicPy from '/snippets/deepagents-sandbox-basic-py.mdx';
+import SandboxBasicJs from '/snippets/deepagents-sandbox-basic-js.mdx';
+
+Agents generate code, interact with filesystems, and run shell commands. Because we can't predict what an agent might do, it's important that its environment is isolated so it can't access credentials, files, or the network. Sandboxes provide this isolation by creating a boundary between the agent's execution environment and your host system.
+
+In deep agents, **sandboxes are [backends](/oss/python/deepagents/backends)** that define the environment where the agent operates. Unlike other backends (State, Filesystem, Store) which only expose file operations, sandbox backends also give the agent an `execute` tool for running shell commands. When you configure a sandbox backend, the agent gets:
+
+- All standard filesystem tools (`ls`, `read_file`, `write_file`, `edit_file`, `glob`, `grep`)
+- The `execute` tool for running arbitrary shell commands in the sandbox
+- A secure boundary that protects your host system
+
+```mermaid
+graph LR
+    subgraph Agent
+        LLM --> Tools
+        Tools --> LLM
+    end
+
+    Agent <-- backend protocol --> Sandbox
+
+    subgraph Sandbox
+        Filesystem
+        Bash
+        Dependencies
+    end
+```
+
+## Why use sandboxes?
+
+A sandbox provides:
+
+- **Security** — Code runs in isolation; it can't access your credentials, files, or network
+- **Clean environments** — Use specific dependencies or OS configurations without local setup
+- **Reproducibility** — Consistent execution environments across teams
+- **Flexibility** — Switch between cloud providers or use local VFS for development
+
+Unlike an in-process Python interpreter, sandboxes also provide the agent with the following abilities:
+
+- **Shell and git** — Run arbitrary commands, use version control, and work with different languages in the same session
+- **Clone repositories** — Many providers offer native git APIs (e.g., [Daytona's git operations](https://www.daytona.io/docs/en/git-operations/)) so the agent can clone and work with repos
+- **Docker-in-Docker** — Run containers inside the sandbox for build and test pipelines
+
+## Available providers
+
+For provider-specific setup, authentication, and lifecycle details, see the provider integration pages:
+
+
+
+<CardGroup cols={2}>
+    <Card title="Modal" icon="/images/providers/modal-icon.svg" href="/oss/python/integrations/providers/modal">
+        ML/AI workloads, GPU access.
+    </Card>
+    <Card title="Daytona" icon="/images/providers/daytona-icon.svg" href="/oss/python/integrations/providers/daytona">
+        TypeScript/Python development, fast cold starts.
+    </Card>
+    <Card title="Runloop" href="/oss/python/integrations/providers/runloop">
+        Disposable devboxes for isolated code execution.
+    </Card>
+</CardGroup>
+
+
+
+
+## Basic usage
+
+These examples assume you have already created a sandbox/devbox using the provider's SDK and have credentials set up. For signup, authentication, and provider-specific lifecycle details, see [Available providers](#available-providers).
+
+<SandboxBasicPy />
+
+
+
+## How sandboxes work
+
+### Isolation boundaries
+
+All sandbox providers protect your host system from the agent's filesystem and shell operations. The agent cannot read your local files, access environment variables on your machine, or interfere with other processes. However, sandboxes alone do **not** protect against:
+
+- **Context injection** — An attacker who controls part of the agent's input can instruct it to run arbitrary commands inside the sandbox. The sandbox is isolated, but the agent has full control within it.
+- **Network exfiltration** — Unless network access is blocked, a context-injected agent can send data out of the sandbox over HTTP or DNS. Some providers support blocking network access (e.g., `blockNetwork: true` on Modal).
+
+See [security considerations](#security-considerations) for how to handle secrets and mitigate these risks.
+
+### The `execute` method
+
+Sandbox backends have a simple architecture: the only method a provider must implement is `execute()`, which runs a shell command and returns its output. Every other filesystem operation — `read`, `write`, `edit`, `ls`, `glob`, `grep` — is built on top of `execute()` by the `BaseSandbox` base class, which constructs scripts and runs them inside the sandbox via `execute()`.
+
+```mermaid
+graph TB
+    subgraph "Agent tools"
+        Tools["ls, read_file, ..."]
+        execute
+    end
+
+    BaseSandbox["BaseSandbox<br/>(uses execute)"] --> Tools
+    execute_method["execute()"] --> BaseSandbox
+    execute_method --> execute
+    Provider["Provider SDK"] --> execute_method
+```
+
+This design means:
+- **Adding a new provider is straightforward.** Implement `execute()` — the base class handles everything else.
+- **The `execute` tool is conditionally available.** On every model call, the harness checks whether the backend implements `SandboxBackendProtocol`. If not, the tool is filtered out and the agent never sees it.
+
+When the agent calls the `execute` tool, it provides a `command` string and gets back the combined stdout/stderr, exit code, and a truncation notice if the output was too large.
+
+You can also call the backend `execute()` method directly in your application code.
+
+<Tabs>
+  <Tab title="Modal">
+
+```python
+import modal
+
+from langchain_modal import ModalSandbox
+
+app = modal.App.lookup("your-app")
+modal_sandbox = modal.Sandbox.create(app=app)
+backend = ModalSandbox(sandbox=modal_sandbox)
+
+result = backend.execute("python --version")
+print(result.output)
+```
+
+  </Tab>
+  <Tab title="Runloop">
+
+<CodeGroup>
+```bash pip
+pip install langchain-runloop
+```
+
+```bash uv
+uv add langchain-runloop
+```
+</CodeGroup>
+
+```python
+from runloop_api_client import RunloopSDK
+
+from langchain_runloop import RunloopSandbox
+
+api_key = "..."
+client = RunloopSDK(bearer_token=api_key)
+
+devbox = client.devbox.create()
+backend = RunloopSandbox(devbox=devbox)
+
+try:
+    result = backend.execute("python --version")
+    print(result.output)
+finally:
+    devbox.shutdown()
+```
+
+  </Tab>
+  <Tab title="Daytona">
+
+<CodeGroup>
+```bash pip
+pip install langchain-daytona
+```
+
+```bash uv
+uv add langchain-daytona
+```
+</CodeGroup>
+
+```python
+from daytona import Daytona
+
+from langchain_daytona import DaytonaSandbox
+
+sandbox = Daytona().create()
+backend = DaytonaSandbox(sandbox=sandbox)
+
+result = backend.execute("python --version")
+print(result.output)
+```
+
+  </Tab>
+</Tabs>
+
+
+For example:
+
+```
+4
+[Command succeeded with exit code 0]
+```
+
+```
+bash: foobar: command not found
+[Command failed with exit code 127]
+```
+
+If a command produces very large output, the result is automatically saved to a file and the agent is instructed to use `read_file` to access it incrementally. This prevents context window overflow.
+
+### Two planes of file access
+
+There are two distinct ways files move in and out of a sandbox, and it's important to understand when to use each:
+
+**Agent filesystem tools** — `read_file`, `write_file`, `edit_file`, `ls`, `glob`, `grep`, and `execute` are the tools the LLM calls during its execution. These go through `execute()` inside the sandbox. The agent uses them to read code, write files, and run commands as part of its task.
+
+**File transfer APIs** — the `uploadFiles()` and `downloadFiles()` methods that your application code calls. These use the provider's native file transfer APIs (not shell commands) and are designed for moving files between your host environment and the sandbox. Use these to:
+- **Seed the sandbox** with source code, configuration, or data before the agent runs
+- **Retrieve artifacts** (generated code, build outputs, reports) after the agent finishes
+- **Pre-populate dependencies** that the agent will need
+
+```mermaid
+graph LR
+    subgraph "Your application"
+        App[Application code]
+    end
+
+    subgraph "Agent"
+        LLM --> Tools["read_file, write_file, ..."]
+        Tools --> LLM
+    end
+
+    subgraph "Sandbox"
+        FS[Filesystem]
+    end
+
+    App -- "Provider API" --> FS
+    Tools -- "execute()" --> FS
+```
+
+
+
+## Working with files
+
+The deepagents sandbox backends support file transfer APIs for moving files between your application and the sandbox.
+
+### Seeding the sandbox
+
+Use `upload_files()` to populate the sandbox before the agent runs. Paths must be absolute and contents are `bytes`:
+
+<Tabs>
+  <Tab title="Modal">
+
+```python
+import modal
+
+from langchain_modal import ModalSandbox
+
+app = modal.App.lookup("your-app")
+modal_sandbox = modal.Sandbox.create(app=app)
+backend = ModalSandbox(sandbox=modal_sandbox)
+
+backend.upload_files(
+    [
+        ("/src/index.py", b"print('Hello')\n"),
+        ("/pyproject.toml", b"[project]\nname = 'my-app'\n"),
+    ]
+)
+```
+
+  </Tab>
+  <Tab title="Runloop">
+
+<CodeGroup>
+```bash pip
+pip install langchain-runloop
+```
+
+```bash uv
+uv add langchain-runloop
+```
+</CodeGroup>
+
+```python
+from runloop_api_client import RunloopSDK
+
+from langchain_runloop import RunloopSandbox
+
+api_key = "..."
+client = RunloopSDK(bearer_token=api_key)
+
+devbox = client.devbox.create()
+backend = RunloopSandbox(devbox=devbox)
+
+backend.upload_files(
+    [
+        ("/src/index.py", b"print('Hello')\n"),
+        ("/pyproject.toml", b"[project]\nname = 'my-app'\n"),
+    ]
+)
+```
+
+  </Tab>
+  <Tab title="Daytona">
+
+<CodeGroup>
+```bash pip
+pip install langchain-daytona
+```
+
+```bash uv
+uv add langchain-daytona
+```
+</CodeGroup>
+
+```python
+from daytona import Daytona
+
+from langchain_daytona import DaytonaSandbox
+
+sandbox = Daytona().create()
+backend = DaytonaSandbox(sandbox=sandbox)
+
+backend.upload_files(
+    [
+        ("/src/index.py", b"print('Hello')\n"),
+        ("/pyproject.toml", b"[project]\nname = 'my-app'\n"),
+    ]
+)
+```
+
+  </Tab>
+</Tabs>
+
+### Retrieving artifacts
+
+Use `download_files()` to retrieve files from the sandbox after the agent finishes:
+
+<Tabs>
+  <Tab title="Modal">
+
+```python
+import modal
+
+from langchain_modal import ModalSandbox
+
+app = modal.App.lookup("your-app")
+modal_sandbox = modal.Sandbox.create(app=app)
+backend = ModalSandbox(sandbox=modal_sandbox)
+
+results = backend.download_files(["/src/index.py", "/output.txt"])
+for result in results:
+    if result.content is not None:
+        print(f"{result.path}: {result.content.decode()}")
+    else:
+        print(f"Failed to download {result.path}: {result.error}")
+```
+
+  </Tab>
+  <Tab title="Runloop">
+
+<CodeGroup>
+```bash pip
+pip install langchain-runloop
+```
+
+```bash uv
+uv add langchain-runloop
+```
+</CodeGroup>
+
+```python
+from runloop_api_client import RunloopSDK
+
+from langchain_runloop import RunloopSandbox
+
+api_key = "..."
+client = RunloopSDK(bearer_token=api_key)
+
+devbox = client.devbox.create()
+backend = RunloopSandbox(devbox=devbox)
+
+results = backend.download_files(["/src/index.py", "/output.txt"])
+for result in results:
+    if result.content is not None:
+        print(f"{result.path}: {result.content.decode()}")
+    else:
+        print(f"Failed to download {result.path}: {result.error}")
+```
+
+  </Tab>
+  <Tab title="Daytona">
+
+<CodeGroup>
+```bash pip
+pip install langchain-daytona
+```
+
+```bash uv
+uv add langchain-daytona
+```
+</CodeGroup>
+
+```python
+from daytona import Daytona
+
+from langchain_daytona import DaytonaSandbox
+
+sandbox = Daytona().create()
+backend = DaytonaSandbox(sandbox=sandbox)
+
+results = backend.download_files(["/src/index.py", "/output.txt"])
+for result in results:
+    if result.content is not None:
+        print(f"{result.path}: {result.content.decode()}")
+    else:
+        print(f"Failed to download {result.path}: {result.error}")
+```
+
+  </Tab>
+</Tabs>
+
+<Note>
+Inside the sandbox, the agent uses filesystem tools (`read_file`, `write_file`). The `upload_files` and `download_files` methods are for your application code to move files across the boundary between your host and the sandbox.
+</Note>
+
+
+## Lifecycle and cleanup
+
+Sandboxes consume resources (and cost money for cloud providers) until they're shut down.
+You **must clean them up** when done. Use `try/finally` to ensure cleanup even when the agent throws an error.
+
+<Tip>
+**Recommend TTL for chat applications.** When users can re-engage after idle time, you often don't know if or when they'll return. Configure a time-to-live (TTL) on the sandbox—for example, TTL to archive or TTL to delete—so the provider automatically cleans up idle sandboxes. Many sandbox providers support this.
+</Tip>
+
+### Basic lifecycle
+
+
+
+The deepagents sandbox abstraction does not expose a delete method; keep it light by cleaning up via the **provider SDK** when you're done:
+
+<Tabs>
+  <Tab title="Modal">
+
+```python
+import modal
+
+from langchain_modal import ModalSandbox
+
+app = modal.App.lookup("your-app")
+modal_sandbox = modal.Sandbox.create(app=app)
+backend = ModalSandbox(sandbox=modal_sandbox)
+
+try:
+    result = backend.execute("echo hello")
+    # ... use sandbox
+finally:
+    modal_sandbox.terminate()
+```
+
+  </Tab>
+  <Tab title="Runloop">
+
+```python
+from runloop_api_client import RunloopSDK
+
+from langchain_runloop import RunloopSandbox
+
+client = RunloopSDK(bearer_token="...")
+devbox = client.devbox.create()
+backend = RunloopSandbox(devbox=devbox)
+
+try:
+    result = backend.execute("echo hello")
+    # ... use sandbox
+finally:
+    devbox.shutdown()
+```
+
+  </Tab>
+  <Tab title="Daytona">
+
+```python
+from daytona import Daytona
+
+from langchain_daytona import DaytonaSandbox
+
+sandbox = Daytona().create()
+backend = DaytonaSandbox(sandbox=sandbox)
+
+try:
+    result = backend.execute("echo hello")
+    # ... use sandbox
+finally:
+    sandbox.stop()
+```
+
+  </Tab>
+</Tabs>
+
+
+### Sandbox patterns
+
+When integrating sandboxes, you have two patterns:
+
+**Reuse a sandbox** across multiple invocations when you want continuity (for example to persist installed dependencies):
+
+
+
+```python
+sandbox = Daytona().create()
+backend = DaytonaSandbox(sandbox=sandbox)
+
+agent = create_deep_agent(
+    model=ChatAnthropic(model="claude-sonnet-4-20250514"),
+    system_prompt="You are a Python coding assistant with sandbox access.",
+    backend=backend,
+)
+
+result = agent.invoke({ "messages": [...] })
+result = agent.invoke({ "messages": [...] }) # Same sandbox, same files
+
+modal_sandbox.terminate()
+```
+
+
+
+**Create a fresh sandbox** per invocation for clean isolation between tasks:
+
+
+
+```python
+agent = create_deep_agent(
+    model=ChatAnthropic(model="claude-sonnet-4-20250514"),
+    system_prompt="You are a Python coding assistant with sandbox access.",
+    backend=DaytonaSandbox(sandbox=Daytona().create()),
+)
+```
+
+
+
+### Sandboxes in middleware
+
+If you provision sandboxes in [middleware](/oss/python/deepagents/middleware), there is no `on_error` hook for cleanup when exceptions occur. As a workaround:
+
+1. **Set a TTL** for the sandbox—most providers support this. Use it even on the happy path; it's especially important when cleanup might not run.
+2. **Use `wrapModelCall` and `wrapToolCall` hooks** to catch unexpected exceptions and clean up resources. Note that this won't help for node-style hooks (`before_agent`, `after_agent`, `before_model`, `after_model`) if the exception arises from other middleware.
+
+
+
+
+## Security considerations
+
+Sandboxes isolate code execution from your host system, but they don't protect against **context injection**. An attacker who controls part of the agent's input can instruct it to read files, run commands, or exfiltrate data from within the sandbox. This makes credentials inside the sandbox especially dangerous.
+
+<Warning>
+**Never put secrets inside a sandbox.** API keys, tokens, database credentials, and other secrets injected into a sandbox (via environment variables, mounted files, or the `secrets` option) can be read and exfiltrated by a context-injected agent. This applies even to short-lived or scoped credentials — if an agent can access them, so can an attacker.
+</Warning>
+
+### Handling secrets safely
+
+If your agent needs to call authenticated APIs or access protected resources, you have two options:
+
+1. **Keep secrets in tools outside the sandbox.** Define tools that run in your host environment (not inside the sandbox) and handle authentication there. The agent calls these tools by name, but never sees the credentials. This is the recommended approach.
+
+2. **Use a network proxy that injects credentials.** Some sandbox providers support proxies that intercept outgoing HTTP requests from the sandbox and attach credentials (e.g., `Authorization` headers) before forwarding them. The agent never sees the secret — it just makes plain requests to a URL. This approach is not yet widely available across providers.
+
+<Warning>
+If you must inject secrets into a sandbox (not recommended), take these precautions:
+
+- Enable [human-in-the-loop](/oss/python/deepagents/human-in-the-loop) approval for **all** tool calls, not just sensitive ones
+- Block or restrict network access from the sandbox to limit exfiltration paths
+- Use the narrowest possible credential scope and shortest possible lifetime
+- Monitor sandbox network traffic for unexpected outbound requests
+
+Even with these safeguards, this remains an unsafe workaround. A sufficiently creative enough context injection attack can bypass output filtering and HITL review.
+</Warning>
+
+### General best practices
+
+- Review sandbox outputs before acting on them in your application
+- Block sandbox network access when not needed
+- Use [middleware](/oss/python/deepagents/middleware) to filter or redact sensitive patterns in tool outputs
+- Treat everything produced inside the sandbox as untrusted input
+
+---
+
+<Callout icon="pen-to-square" iconType="regular">
+    [Edit this page on GitHub](https://github.com/langchain-ai/docs/edit/main/src/oss/deepagents/sandboxes.mdx) or [file an issue](https://github.com/langchain-ai/docs/issues/new/choose).
+</Callout>
+<Tip icon="terminal" iconType="regular">
+    [Connect these docs](/use-these-docs) to Claude, VSCode, and more via MCP for real-time answers.
+</Tip>
